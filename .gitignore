@@ -1,1 +1,4 @@
-Invalid switch - /\n__pycache__
+data/
+__pycache__/
+*.exe
+lexicon.txt

@@ -1,152 +1,280 @@
-// lexicon.cpp -- builds the lexicon (word -> wordID) from docs.jsonl.
-//
-// Build (from the Veridex folder):
-//   g++ -std=c++11 -O2 engine/lexicon.cpp -o engine/lexicon.exe
-// Run:
-//   ./engine/lexicon.exe sample/sample_500.jsonl lexicon.txt
-//
-// Output file format (see DESIGN.md):  wordID<TAB>word   (one word per line)
-
-#include <chrono>
-#include <fstream>
-#include <iostream>
-#include <string>
-#include <unordered_map>
-#include <vector>
+#include "lexicon.hpp"
 #include "json.hpp"
 
-class Lexicon {
-public:
-    // ---------- tokenizer: THE shared rules from DESIGN.md ----------
-    // Lowercase; a word is a run of a-z / 0-9; everything else separates words;
-    // keep only tokens of length 2..30; no stopword removal.
-    // Static so teammates can call Lexicon::tokenize(...) for documents AND for queries.
-    static std::vector<std::string> tokenize(const std::string& s) {
-        std::vector<std::string> out;
-        std::string cur;
-        for (size_t i = 0; i <= s.size(); i++) {
-            char c = (i < s.size()) ? s[i] : ' ';           // sentinel space flushes the last word
-            if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';    // manual lowercase (ASCII only)
-            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
-                cur += c;
-            } else {                                        // separator (also all non-ASCII bytes)
-                if (cur.size() >= 2 && cur.size() <= 30) out.push_back(cur);
-                cur.clear();
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+
+namespace {
+using json = nlohmann::json;
+
+// Pull a string field out of a JSON object safely.
+// Returns "" when:
+//   * the key is missing
+//   * the value is JSON null
+//   * the value is not a JSON string
+// This is exactly what we want for the Federal Register corpus, where
+// `abstract` is frequently null and any field may be absent on a bad record.
+std::string stringField(const json& obj, const char* key) {
+    auto it = obj.find(key);
+    if (it == obj.end() || !it->is_string()) {
+        return std::string();
+    }
+    return it->get<std::string>();
+}
+} // namespace
+
+// TOKENIZER -- the single source of truth for "what is a word"
+// Rules (must match DESIGN.md and the search side):
+//   1. Lowercase only ASCII A-Z. Non-ASCII bytes are left alone; they will
+//      be treated as separators below, which is what we want for an English
+//      corpus that may contain stray UTF-8.
+//   2. A word is a maximal run of [a-z0-9]. Every other byte separates words.
+//      So "co-loading" -> "co", "loading"; "$2,000,000" -> "000", "000";
+//      "NVOCCs" -> "nvocc" (the trailing 's' is a letter, so it stays: "nvoccs").
+//   3. Keep only tokens of length 2..30. This drops noise like "a", "7",
+//      and pathological single tokens, while keeping real words intact.
+//   4. No stopword removal: stopword filtering belongs at query time, not
+//      here, so the index can still answer phrase queries that include them.
+//
+// The loop runs one past the end with a sentinel space so the final token
+// is flushed without an extra branch after the loop.
+std::vector<std::string> Lexicon::tokenize(const std::string& text) {
+    std::vector<std::string> tokens;
+    tokens.reserve(text.size() / 6 + 1); // rough guess, avoids early reallocs
+
+    std::string current;
+
+    for (std::size_t i = 0; i <= text.size(); ++i) {
+        char c = (i < text.size()) ? text[i] : ' '; // sentinel flushes last token
+
+        // Manual ASCII lowercase (cheaper than std::tolower and locale-free).
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+
+        const bool isWordChar =
+            (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+
+        if (isWordChar) {
+            current.push_back(c);
+        } else {
+            if (current.size() >= 2 && current.size() <= 30) {
+                tokens.push_back(current);
             }
+            current.clear();
         }
-        return out;
     }
 
-    // ---------- body cleanup ----------
-    // The downloaded text starts with a GPO header and has "[[Page 43]]" markers inside.
-    // Skip everything before the first "[[Page" marker, then drop every "[[...]]" marker.
-    static std::string cleanBody(const std::string& t) {
-        size_t start = t.find("[[Page");
-        std::string s = (start == std::string::npos) ? t : t.substr(start);  // no marker: keep all
-        std::string out;
-        size_t i = 0;
-        while (i < s.size()) {
-            if (s.compare(i, 2, "[[") == 0) {               // marker begins
-                size_t end = s.find("]]", i);
-                if (end == std::string::npos) break;        // malformed: stop
-                i = end + 2;                                // jump past the marker
-            } else {
-                out += s[i++];
+    return tokens;
+}
+
+// BODY CLEANUP -- strip the Federal Register wrapper
+// The downloaded body looks like:
+//   "Federal Register, Volume 89 Issue 1 (...) [Pages 43-48] ... SUMMARY: ...
+//    ... [[Page 44]] ... [[Page 45]] ... [FR Doc. ...]"
+//
+// We want to throw away the GPO header (everything up to the first "[[Page"
+// marker) and then drop every "[[...]]" marker from what remains. If the
+// input has no "[[Page" marker at all (e.g. a future corpus or a hand-written
+// test), we keep the whole string -- nothing is a wrapper, so nothing is
+// stripped.
+//
+// A malformed trailing "[[" with no closing "]]" is dropped along with the
+// rest of the input; the document is already truncated at that point and
+// keeping half a marker would just inject junk tokens.
+std::string Lexicon::cleanBody(const std::string& text) {
+    const std::size_t start = text.find("[[Page");
+    const std::string source =
+        (start == std::string::npos) ? text : text.substr(start);
+
+    std::string cleaned;
+    cleaned.reserve(source.size());
+
+    std::size_t i = 0;
+    while (i < source.size()) {
+        if (source.compare(i, 2, "[[") == 0) {
+            const std::size_t end = source.find("]]", i + 2);
+            if (end == std::string::npos) {
+                // Malformed: stop here rather than emit half a marker.
+                break;
             }
+            i = end + 2; // skip the whole "[[...]]" chunk
+        } else {
+            cleaned.push_back(source[i]);
+            ++i;
         }
-        return out;
     }
 
-    // ---------- add one word; returns its wordID ----------
-    int addWord(const std::string& w) {
-        auto it = ids_.find(w);
-        if (it != ids_.end()) return it->second;            // already known
-        int id = (int)words_.size();                        // next free ID = 0,1,2,... by first appearance
-        ids_[w] = id;
-        words_.push_back(w);
-        return id;
+    return cleaned;
+}
+
+// DICTIONARY OPERATIONS
+int Lexicon::addWord(const std::string& word) {
+    // Fast path: word already known. Never renumber an existing word.
+    auto it = ids_.find(word);
+    if (it != ids_.end()) {
+        return it->second;
     }
 
-    // ---------- lookup: -1 if the word is not in the lexicon ----------
-    int getId(const std::string& w) const {
-        auto it = ids_.find(w);
-        return it == ids_.end() ? -1 : it->second;
+    // New word: its ID is the current size, so IDs are contiguous 0..N-1
+    // in first-appearance order. This invariant is what makes save()/load()
+    // round-trip exactly.
+    const int wordID = static_cast<int>(words_.size());
+
+    ids_.emplace(word, wordID);
+    words_.push_back(word);
+    return wordID;
+}
+
+int Lexicon::getId(const std::string& word) const {
+    auto it = ids_.find(word);
+    return (it == ids_.end()) ? -1 : it->second;
+}
+
+const std::string& Lexicon::getWord(int id) const {
+    // A bad ID here is a bug in the caller (e.g. an index record whose ID
+    // does not match this lexicon). Fail loudly rather than read out of bounds.
+    if (id < 0 || static_cast<std::size_t>(id) >= words_.size()) {
+        throw std::out_of_range("Lexicon::getWord: invalid word ID");
+    }
+    return words_[static_cast<std::size_t>(id)];
+}
+
+std::size_t Lexicon::size() const {
+    return words_.size();
+}
+
+void Lexicon::addText(const std::string& text) {
+    for (const std::string& word : tokenize(text)) {
+        addWord(word);
+    }
+}
+
+// BUILD -- read docs.jsonl line by line
+bool Lexicon::build(const std::string& docsPath) {
+    std::ifstream input(docsPath);
+    if (!input.is_open()) {
+        std::cerr << "Error: cannot open " << docsPath << '\n';
+        return false;
     }
 
-    size_t size() const { return words_.size(); }
-    const std::string& getWord(int id) const { return words_[id]; }
+    // Make build() idempotent: calling it twice must not accumulate state
+    // from a previous corpus, which would silently shift wordIDs.
+    ids_.clear();
+    words_.clear();
 
-    // ---------- build from docs.jsonl (one JSON document per line) ----------
-    // Reads line by line, so the whole file is never held in RAM.
-    bool build(const std::string& docsPath) {
-        std::ifstream in(docsPath);
-        if (!in) { std::cerr << "Cannot open " << docsPath << "\n"; return false; }
-        std::string line;
-        size_t docs = 0, bad = 0;
-        auto t0 = std::chrono::steady_clock::now();
-        while (std::getline(in, line)) {
-            if (line.empty()) continue;
-            nlohmann::json d = nlohmann::json::parse(line, nullptr, false);  // false = don't throw
-            if (d.is_discarded() || !d.is_object()) { bad++; continue; }     // skip broken lines
-            // title, abstract and text are indexed; any of them may be null/missing
-            addText(strField(d, "title"));
-            addText(strField(d, "abstract"));
-            addText(cleanBody(strField(d, "text")));
-            docs++;
-            if (docs % 5000 == 0) std::cout << "  " << docs << " docs, " << words_.size() << " words\n";
+    const auto startTime = std::chrono::steady_clock::now();
+
+    std::size_t documents = 0;
+    std::size_t badLines = 0;
+    std::string line;
+
+    while (std::getline(input, line)) {
+        if (line.empty()) {
+            continue;
         }
-        double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        std::cout << "Done: " << docs << " docs (" << bad << " bad lines), "
-                  << words_.size() << " unique words, " << secs << " s\n";
-        return true;
-    }
 
-    // ---------- save as lexicon.txt: wordID<TAB>word ----------
-    bool save(const std::string& path) const {
-        std::ofstream out(path);
-        if (!out) return false;
-        for (size_t i = 0; i < words_.size(); i++) out << i << '\t' << words_[i] << '\n';
-        return true;
-    }
-
-    // ---------- load an existing lexicon.txt (used later by indexer + search) ----------
-    bool load(const std::string& path) {
-        std::ifstream in(path);
-        if (!in) return false;
-        ids_.clear(); words_.clear();
-        std::string line;
-        while (std::getline(in, line)) {
-            size_t tab = line.find('\t');
-            if (tab == std::string::npos) continue;
-            addWord(line.substr(tab + 1));                  // IDs are the line order, so they match
+        // `false` -> do not throw on parse error; return a discarded value.
+        const json document = json::parse(line, nullptr, false);
+        if (document.is_discarded() || !document.is_object()) {
+            ++badLines;
+            continue;
         }
-        return true;
+
+        // All three text fields are indexed. Any of them may be missing or
+        // null (abstract frequently is); stringField() collapses that to "".
+        addText(stringField(document, "title"));
+        addText(stringField(document, "abstract"));
+        addText(cleanBody(stringField(document, "text")));
+
+        ++documents;
+        if (documents % 5000 == 0) {
+            std::cout << "  " << documents << " docs, "
+                      << words_.size() << " unique words\n";
+        }
     }
 
-private:
-    std::unordered_map<std::string, int> ids_;              // word -> wordID (fast lookup)
-    std::vector<std::string> words_;                        // wordID -> word (index = ID)
+    const double seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - startTime).count();
 
-    void addText(const std::string& s) {
-        for (const std::string& w : tokenize(s)) addWord(w);
+    std::cout << "Done: " << documents << " docs ("
+              << badLines << " bad lines), "
+              << words_.size() << " unique words, "
+              << seconds << " s\n";
+    return true;
+}
+
+// SAVE / LOAD -- the lexicon.txt on-disk contract
+bool Lexicon::save(const std::string& path) const {
+    std::ofstream output(path);
+    if (!output.is_open()) {
+        return false;
     }
 
-    // Safe string getter: returns "" when the field is missing or null (abstract can be null).
-    static std::string strField(const nlohmann::json& d, const char* key) {
-        auto it = d.find(key);
-        if (it == d.end() || !it->is_string()) return "";
-        return it->get<std::string>();
+    for (std::size_t i = 0; i < words_.size(); ++i) {
+        output << i << '\t' << words_[i] << '\n';
     }
-};
 
-int main(int argc, char** argv) {
-    if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <docs.jsonl> <lexicon.txt>\n";
-        return 1;
+    // Catch disk-full / permission errors that would otherwise look like success.
+    return output.good();
+}
+
+bool Lexicon::load(const std::string& path) {
+    std::ifstream input(path);
+    if (!input.is_open()) {
+        return false;
     }
-    Lexicon lex;
-    if (!lex.build(argv[1])) return 1;
-    if (!lex.save(argv[2])) { std::cerr << "Cannot write " << argv[2] << "\n"; return 1; }
-    std::cout << "Saved " << lex.size() << " words to " << argv[2] << "\n";
-    return 0;
+
+    ids_.clear();
+    words_.clear();
+
+    std::string line;
+    std::size_t expectedID = 0;
+
+    while (std::getline(input, line)) {
+        // Tolerate a trailing blank line (some editors add one). It carries
+        // no record, so it is not a corruption.
+        if (line.empty()) {
+            continue;
+        }
+
+        const std::size_t tab = line.find('\t');
+        if (tab == std::string::npos) {
+            ids_.clear();
+            words_.clear();
+            return false;
+        }
+
+        const std::string idString = line.substr(0, tab);
+        const std::string word = line.substr(tab + 1);
+
+        char* end = nullptr;
+        const long id = std::strtol(idString.c_str(), &end, 10);
+
+        // Every record must be well-formed and IDs must be 0,1,2,... in
+        // line order, so a reloaded lexicon is byte-for-byte the same map
+        // the indexer saw. Anything else is treated as corruption.
+        const bool bad =
+            end == idString.c_str() ||       // no digits at all
+            *end != '\0' ||                  // trailing garbage after the digits
+            id < 0 ||                        // negative
+            static_cast<std::size_t>(id) != expectedID || // out of order / gap
+            word.empty() ||                  // empty word
+            ids_.find(word) != ids_.end();   // duplicate word
+
+        if (bad) {
+            ids_.clear();
+            words_.clear();
+            return false;
+        }
+
+        words_.push_back(word);
+        ids_.emplace(word, static_cast<int>(id));
+        ++expectedID;
+    }
+
+    return input.eof();
 }

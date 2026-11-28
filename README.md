@@ -34,19 +34,30 @@ g++ -std=c++11 -O2 engine/main_forward.cpp engine/forward_index.cpp engine/lexic
 
 Output: `forward_index.bin`, one record per document in docID order.
 
-## Forward index details
+## Forward index
 
-**Record fields:** `document_number`, `title`, `abstract`, `publication_date`, `type`, `agency_names`, and `bodyLength` (token count after `Lexicon::cleanBody` + `Lexicon::tokenize`).
+Maps each document to the words it contains and how often (docID -> `(wordID, tf)`). It is the input for building the inverted index. It stores no titles, dates or agencies; those go in a separate document store.
 
-**docID rule:** docIDs are assigned to valid JSON lines in file order (0, 1, 2, ...). Malformed lines are skipped and do **not** consume a docID. The inverted indexer must follow the same rule.
+**Contents per document:** a list of `(wordID, tf)` pairs sorted by wordID, and the document length in tokens (sum of its `tf` values). It indexes the same fields as the lexicon: title, abstract and cleaned text.
 
-**File format:**
-- Versioned, little-endian binary with magic `FWDIDX01`
-- Length-prefixed strings, so loading is a buffered read plus a cursor walk, with no JSON parsing at search time
-- Saved atomically (temp file + rename)
-- `load()` rejects truncated, stale-magic, or trailing-byte files instead of returning a half-loaded index
+**docID rule:** docIDs are assigned to valid JSON lines in file order (0, 1, 2, ...). Blank and malformed lines are skipped and do not consume a docID. The inverted indexer and the document store must follow the same rule.
 
-**Size:** the full dataset (~48k records) stays small because body text is not stored here. It lives in the inverted index and the original `texts/<docnum>.txt` files.
+**File format (`forward_index.bin`):**
+- Versioned, little-endian binary with magic `FWDIDX03`
+- Header, then a per-document table, then fixed-size `(wordID, tf)` entries
+- Saved via a temp file and rename
+- `load()` rejects wrong-magic, truncated, over-long or inconsistent files, and leaves the existing index untouched
+
+**Size:** about 22 million entries and a 177 MB file for the full 48k-document dataset (estimated from the sample repeated to full size).
+
+**Build** (from the repo root; the lexicon must be built first from the same corpus file):
+
+```
+g++ -std=c++11 -O2 engine/main_forward.cpp engine/forward_index.cpp engine/lexicon.cpp -o engine/forward_index.exe
+engine/forward_index.exe sample/sample_500.jsonl output/lexicon.txt output/forward_index.bin
+```
+
+See `DESIGN.md` for the exact file layout.
 
 ## Data
 

@@ -1,4 +1,5 @@
 data/
 __pycache__/
 *.exe
+*.bin
 lexicon.txt

@@ -235,6 +235,12 @@ bool Lexicon::load(const std::string& path) {
     std::size_t expectedID = 0;
 
     while (std::getline(input, line)) {
+        // A lexicon written on Windows has CRLF line endings; getline() only
+        // removes the '\n', so drop the leftover '\r' before parsing.
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        
         // Tolerate a trailing blank line (some editors add one). It carries
         // no record, so it is not a corruption.
         if (line.empty()) {
